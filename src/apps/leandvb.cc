@@ -211,6 +211,7 @@ struct runtime_common {
   pipebuf<int> *p_verrcount;
 
   pipebuf<tspacket> *p_tspackets;
+  pipebuf<u8> *p_gsepackets;
   
   runtime_common(const config &cfg) {
     sch = new scheduler();
@@ -258,6 +259,7 @@ struct runtime_common {
 
     // Min buffer size for TS packets: Up to 39 per BBFRAME
     unsigned long BUF_S2PACKETS = (fec_info::KBCH_MAX/188/8+1) * cfg.buf_factor;
+    unsigned long BUF_S2GSEPACKETS = (fec_info::KBCH_MAX/8+1) * cfg.buf_factor;
     // Min buffer size for misc measurements: 1
     unsigned long BUF_SLOW = cfg.buf_factor;
 
@@ -572,6 +574,7 @@ struct runtime_common {
 #endif
 
     p_tspackets = new pipebuf<tspacket>(sch, "TS packets", BUF_S2PACKETS);
+    p_gsepackets = new pipebuf<u8>(sch, "GSE packets", BUF_S2GSEPACKETS);
 
     p_vbitcount= new pipebuf<int>(sch, "Bits processed", BUF_S2PACKETS);
     p_verrcount = new pipebuf<int>(sch, "Bits corrected", BUF_S2PACKETS);
@@ -580,6 +583,7 @@ struct runtime_common {
     // outputting into p_tspackets and into the measurements channels.
 
     new file_writer<tspacket>(sch, *p_tspackets, 1);
+    new file_writer<u8>(sch, *p_gsepackets, cfg.fd_gse);
 
     // BER ESTIMATION
 
@@ -744,9 +748,8 @@ int run_dvbs2(config &cfg) {
   }
 
   // Deframe BB frames to TS packets
-  s2_deframer deframer(run.sch, p_bbframes, *run.p_tspackets,
+  s2_deframer deframer(run.sch, p_bbframes, *run.p_tspackets, *run.p_gsepackets,
 		       run.p_lock, run.p_locktime);
-  if ( cfg.fd_gse >= 0 ) deframer.fd_gse = cfg.fd_gse;
 
   if ( cfg.debug )
     fprintf(stderr,
@@ -1449,7 +1452,8 @@ void usage(const char *name, FILE *f, int c, const char *info=NULL) {
     (f, "\nTesting options:\n"
      "  --fd-pp FDNUM         Dump preprocessed IQ data to file descriptor\n"
      "  --fd-iqsymbols FDNUM  Dump sampled IQ symbols to file descriptor\n"
-     "  --fd-gse FDNUM        Dump DVB-S2 generic streams to this FD\n"
+     "  --fd-gse FDNUM        Dump DVB-S2 generic streams to file descriptor\n"
+     "  --f-gse PATH          Dump DVB-S2 generic streams to file\n"
      "  --awgn FLOAT  Add white gaussian noise stddev (slow)\n"
      );
   if ( info ) fprintf(f, "** Error while processing '%s'\n", info);
@@ -1605,6 +1609,15 @@ int main(int argc, const char *argv[]) {
       cfg.Fderot = atof(argv[++i]);
     else if ( ! strcmp(argv[i], "--fd-pp") && i+1<argc )
       cfg.fd_pp = atoi(argv[++i]);
+    else if ( ! strcmp(argv[i], "--f-gse") && i+1<argc )
+    {
+      int fd = open(argv[++i], O_WRONLY);
+
+      if(fd < 0)
+        fail("open gse file");
+
+      cfg.fd_gse = fd;
+    }
     else if ( ! strcmp(argv[i], "--fd-gse") && i+1<argc )
       cfg.fd_gse = atoi(argv[++i]);
     else if ( ! strcmp(argv[i], "--awgn") && i+1<argc )

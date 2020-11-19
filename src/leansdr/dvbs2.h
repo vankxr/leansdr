@@ -2398,78 +2398,136 @@ namespace leansdr {
     // For VCM with a repeating pattern, use n_pls_seq>=2.
     s2_pls *pls_seq;
     int n_pls_seq;
+    int fr_total; // total bbframes
+    int fr_gse; // frames dedicated to gse data (fr_gse < fr_total)
 
-    s2_framer(scheduler *sch, pipebuf<tspacket> &_in, pipebuf<bbframe> &_out)
+    s2_framer(scheduler *sch, pipebuf<tspacket> &_in_ts, pipebuf<u8> &_in_gse, pipebuf<bbframe> &_out)
       : runnable(sch, "S2 framer"),
 	n_pls_seq(0),
+  fr_total(1),
+  fr_gse(0),
 	pls_index(0),
-	in(_in), out(_out)
+  fr_index(0),
+	in_ts(_in_ts), in_gse(_in_gse), out(_out)
     {
       nremain = 0;
       remcrc = 0;  // CRC for nonexistent previous packet
     }
     void run() {
       while ( out.writable() >= 1 ) {
-	if ( ! n_pls_seq ) fail("PLS not specified");
-	s2_pls *pls = &pls_seq[pls_index];
-	const modcod_info *mcinfo = check_modcod(pls->modcod);
-	const fec_info *fi = &fec_infos[pls->sf][mcinfo->rate];
-	int framebytes = fi->Kbch / 8;
-	if ( ! framebytes ) fail("MODCOD/framesize combination not allowed");
-	if ( 10+nremain+188*in.readable() < framebytes )
-	  break;  // Not enough data to fill a frame
-	bbframe *pout = out.wr();
-	pout->pls = *pls;
-	uint8_t *buf = pout->bytes;
-	uint8_t *end = buf + framebytes;
-	// EN 302 307-1 section 5.1.6 Base-Band Header insertion
-	uint8_t *bbheader = buf;
-	uint8_t matype1 = 0;
-	matype1 |= 0xc0;  // TS
-	matype1 |= 0x20;  // SIS
-	matype1 |= (n_pls_seq==1) ? 0x10 : 0x00;  // CCM/ACM
-	// TBD ISSY/NPD required for ACM ?
-	matype1 |= rolloff_code;
-	*buf++ = matype1;              // MATYPE-1
-	*buf++ = 0;                    // MATYPE-2
-	uint16_t upl = 188 * 8;
-	*buf++ = upl >> 8;             // UPL MSB
-	*buf++ = upl;                  // UPL LSB
-	uint16_t dfl = (framebytes-10) * 8;
-	*buf++ = dfl >> 8;             // DFL MSB
-	*buf++ = dfl;                  // DFL LSB
-	*buf++ = 0x47;                 // SYNC
-	uint16_t syncd = nremain * 8;
-	*buf++ = syncd >> 8;           // SYNCD MSB
-	*buf++ = syncd;                // SYNCD LSB
-	*buf++ = crc8.compute(bbheader, 9);
-	// Data field
-	memcpy(buf, rembuf, nremain);  // Leftover from previous runs
-	buf += nremain;
-	while ( buf < end ) {
-	  tspacket *tsp = in.rd();
-	  if ( tsp->data[0] != MPEG_SYNC ) fail("Invalid TS");
-	  *buf++ = remcrc;  // Replace SYNC with CRC of previous.
-	  remcrc = crc8.compute(tsp->data+1, tspacket::SIZE-1);
-	  int nused = end - buf;
-	  if ( nused > tspacket::SIZE-1 ) nused = tspacket::SIZE-1;
-	  memcpy(buf, tsp->data+1, nused);
-	  buf += nused;
-	  if ( buf == end ) {
-	    nremain = (tspacket::SIZE-1) - nused;
-	    memcpy(rembuf, tsp->data+1+nused, nremain);
-	  }
-	  in.read(1);
-	}
-	if ( buf != end ) fail("Bug: s2_framer");
-	out.written(1);
-	++pls_index;
-	if ( pls_index == n_pls_seq ) pls_index = 0;
+        if ( ! n_pls_seq ) fail("PLS not specified");
+        s2_pls *pls = &pls_seq[pls_index];
+        const modcod_info *mcinfo = check_modcod(pls->modcod);
+        const fec_info *fi = &fec_infos[pls->sf][mcinfo->rate];
+        int framebytes = fi->Kbch / 8;
+        if ( ! framebytes ) fail("MODCOD/framesize combination not allowed");
+        bbframe *pout = out.wr();
+        pout->pls = *pls;
+        uint8_t *buf = pout->bytes;
+        uint8_t *end = buf + framebytes;
+
+        if(fr_index < fr_gse)
+        {
+          size_t gse_readable = in_gse.readable();
+
+          if(gse_readable > framebytes - 10)
+            gse_readable = framebytes - 10;
+
+          // EN 302 307-1 section 5.1.6 Base-Band Header insertion
+          uint8_t *bbheader = buf;
+          uint8_t matype1 = 0;
+          matype1 |= 0x40;  // Generic continuous
+          matype1 |= 0x20;  // SIS
+          matype1 |= (n_pls_seq==1) ? 0x10 : 0x00;  // CCM/ACM
+          // TBD ISSY/NPD required for ACM ?
+          matype1 |= rolloff_code;
+          *buf++ = matype1;              // MATYPE-1
+          *buf++ = 0;                    // MATYPE-2
+          uint16_t upl = 0;
+          *buf++ = upl >> 8;             // UPL MSB
+          *buf++ = upl;                  // UPL LSB
+          uint16_t dfl = gse_readable * 8;
+          *buf++ = dfl >> 8;             // DFL MSB
+          *buf++ = dfl;                  // DFL LSB
+          *buf++ = 0x00;                 // SYNC
+          uint16_t syncd = 0;
+          *buf++ = syncd >> 8;           // SYNCD MSB
+          *buf++ = syncd;                // SYNCD LSB
+          *buf++ = crc8.compute(bbheader, 9);
+          // Data field
+          for(size_t i = 0; i < framebytes - 10; i++)
+          {
+            if(i < gse_readable)
+            {
+              u8 *gsep = in_gse.rd();
+              *buf++ = *gsep;
+              in_gse.read(1);
+            }
+            else
+            {
+              *buf++ = 0;
+            }
+          }
+        }
+        else
+        {
+          if ( 10+nremain+188*in_ts.readable() < framebytes )
+            break;  // Not enough data to fill a frame
+          // EN 302 307-1 section 5.1.6 Base-Band Header insertion
+          uint8_t *bbheader = buf;
+          uint8_t matype1 = 0;
+          matype1 |= 0xc0;  // TS
+          matype1 |= 0x20;  // SIS
+          matype1 |= (n_pls_seq==1) ? 0x10 : 0x00;  // CCM/ACM
+          // TBD ISSY/NPD required for ACM ?
+          matype1 |= rolloff_code;
+          *buf++ = matype1;              // MATYPE-1
+          *buf++ = 0;                    // MATYPE-2
+          uint16_t upl = 188 * 8;
+          *buf++ = upl >> 8;             // UPL MSB
+          *buf++ = upl;                  // UPL LSB
+          uint16_t dfl = (framebytes-10) * 8;
+          *buf++ = dfl >> 8;             // DFL MSB
+          *buf++ = dfl;                  // DFL LSB
+          *buf++ = 0x47;                 // SYNC
+          uint16_t syncd = nremain * 8;
+          *buf++ = syncd >> 8;           // SYNCD MSB
+          *buf++ = syncd;                // SYNCD LSB
+          *buf++ = crc8.compute(bbheader, 9);
+          // Data field
+          memcpy(buf, rembuf, nremain);  // Leftover from previous runs
+          buf += nremain;
+          while ( buf < end ) {
+            tspacket *tsp = in_ts.rd();
+            if ( tsp->data[0] != MPEG_SYNC ) fail("Invalid TS");
+            *buf++ = remcrc;  // Replace SYNC with CRC of previous.
+            remcrc = crc8.compute(tsp->data+1, tspacket::SIZE-1);
+            int nused = end - buf;
+            if ( nused > tspacket::SIZE-1 ) nused = tspacket::SIZE-1;
+            memcpy(buf, tsp->data+1, nused);
+            buf += nused;
+            if ( buf == end ) {
+              nremain = (tspacket::SIZE-1) - nused;
+              memcpy(rembuf, tsp->data+1+nused, nremain);
+            }
+            in_ts.read(1);
+          }
+        }
+        if ( buf != end ) fail("Bug: s2_framer");
+        out.written(1);
+
+        ++pls_index;
+        if ( pls_index == n_pls_seq ) pls_index = 0;
+
+        ++fr_index;
+        if ( fr_index == fr_total ) fr_index = 0;
       }
     }
   private:
     int pls_index;  // Next slot to use in pls_seq
-    pipereader<tspacket> in;
+    int fr_index; // current bbframe index
+    pipereader<tspacket> in_ts;
+    pipereader<u8> in_gse;
     pipewriter<bbframe> out;
     crc8_engine crc8;
     int nremain;
@@ -2482,14 +2540,12 @@ namespace leansdr {
   // EN 302 307-1 section 5.1 Mode adaptation
 
   struct s2_deframer : runnable {
-    int fd_gse;  // FD for generic streams, or -1
-    s2_deframer(scheduler *sch, pipebuf<bbframe> &_in, pipebuf<tspacket> &_out,
+    s2_deframer(scheduler *sch, pipebuf<bbframe> &_in, pipebuf<tspacket> &_out_ts, pipebuf<u8> &_out_gse,
 		pipebuf<int> *_state_out=NULL,
 		pipebuf<unsigned long> *_locktime_out=NULL)
       : runnable(sch, "S2 deframer"),
-	fd_gse(-1),
 	nleftover(-1),
-	in(_in), out(_out,MAX_TS_PER_BBFRAME),
+	in(_in), out_ts(_out_ts,MAX_TS_PER_BBFRAME), out_gse(_out_gse),
 	current_state(false),
 	state_out(opt_writer(_state_out,2)),
 	report_state(true),
@@ -2497,7 +2553,7 @@ namespace leansdr {
 	locktime_out(opt_writer(_locktime_out,MAX_TS_PER_BBFRAME))
     { }
     void run() {
-      while ( in.readable()>=1 && out.writable()>=MAX_TS_PER_BBFRAME &&
+      while ( in.readable()>=1 && out_ts.writable()>=MAX_TS_PER_BBFRAME &&
 	      opt_writable(state_out,2) &&
 	      opt_writable(locktime_out,MAX_TS_PER_BBFRAME) ) {
 	if ( report_state ) {
@@ -2555,11 +2611,8 @@ namespace leansdr {
       if ( streamtype==3 && upl==188*8 && sync==0x47 && syncd<=dfl)
 	handle_ts(data, dfl, syncd, sync);
       else if ( streamtype == 1 ) {
-	if ( fd_gse >= 0 ) {
-	  ssize_t nw = write(fd_gse, data, dfl/8);
-	  if ( nw < 0 ) fatal("write(gse)");
-	  if ( nw != dfl/8 ) fail("partial write(gse");
-	}
+        for(uint16_t i = 0; i < dfl/8; i++)
+          out_gse.write(data[i]);
       } else {
 	fprintf(stderr, "Unrecognized bbframe\n");
       }
@@ -2583,7 +2636,7 @@ namespace leansdr {
       }
       while ( pos+(188-nleftover)+1 <= dfl/8 ) {
 	// Enough data available for one packet and its CRC.
-	tspacket *pout = out.wr();
+	tspacket *pout = out_ts.wr();
 	memcpy(pout->data, leftover, nleftover);  // NOP most of the time
 	memcpy(pout->data+nleftover, data+pos, 188-nleftover);
 	pout->data[0] = sync;  // Replace CRC
@@ -2594,7 +2647,7 @@ namespace leansdr {
 	  pout->data[1] |= 0x80;  // Set TEI bit
 	  if ( sch->debug ) fprintf(stderr, "C");
 	}
-	out.written(1);
+	out_ts.written(1);
 	pos += 188 - nleftover;
 	nleftover = 0;
       }
@@ -2630,7 +2683,8 @@ namespace leansdr {
     static const int MAX_TS_PER_BBFRAME = fec_info::KBCH_MAX/8/188 + 1;
     bool locked;
     pipereader<bbframe> in;
-    pipewriter<tspacket> out;
+    pipewriter<tspacket> out_ts;
+    pipewriter<u8> out_gse;
     int current_state;
     pipewriter<int> *state_out;
     bool report_state;

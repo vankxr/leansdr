@@ -44,6 +44,7 @@ struct file_reader : runnable {
   {
   }
   void run() {
+    if (fdin < 0) return;
     size_t size = out.writable() * sizeof(T);
     if ( ! size ) return;
 
@@ -80,6 +81,7 @@ struct file_reader : runnable {
   }
   bool loop;
   void set_realtime(T &_filler) {
+    if (fdin < 0) return;
     int flags = fcntl(fdin, F_GETFL);
     if ( fcntl(fdin, F_SETFL, flags|O_NONBLOCK) ) fatal("fcntl");
     filler = new T(_filler);
@@ -99,6 +101,7 @@ struct file_writer : runnable {
     in(_in), fdout(_fdout) {
   }
   void run() {
+    if ( fdout < 0 ) return;
     int size = in.readable() * sizeof(T);
     if ( ! size ) return;
     int nw = write(fdout, in.rd(), size);

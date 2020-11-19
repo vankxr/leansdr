@@ -63,6 +63,9 @@ struct config {
   static const int MAX_PLS_SEQ = 256;
   s2_pls pls_seq[MAX_PLS_SEQ];
   int n_pls_seq;
+  int fd_gse;          // FD for DVB-S2 Generic streams, or -1
+  int bb_total;
+  int bb_gse;
   // Common
   int buf_factor;
   float amp;       // Desired RMS constellation amplitude
@@ -76,7 +79,10 @@ struct config {
   bool verbose, debug;
   config()
     : standard(DVB_S),
-      buf_factor(2),
+      fd_gse(-1),
+      bb_total(1),
+      bb_gse(0),
+      buf_factor(4),
       amp(1.0f), agc(false),
       interp(2), decim(1), rolloff(0.35), rrc_rej(10),
       output_format(OUTPUT_F32),
@@ -224,7 +230,8 @@ void run_dvbs2(config &cfg) {
   sch.verbose = cfg.verbose;
   sch.debug = cfg.debug;
 
-  unsigned long BUF_PACKETS = (64800/8+187)/188 * cfg.buf_factor * 2;
+  unsigned long BUF_TSPACKETS = (64800/8+187)/188 * cfg.buf_factor * 2;
+  unsigned long BUF_GSEPACKETS = (64800/8) * cfg.buf_factor * 2;
   unsigned long BUF_FRAMES = cfg.buf_factor;
   unsigned long BUF_SLOTS =
     (1+modcod_info::MAX_SLOTS_PER_FRAME) * cfg.buf_factor;
@@ -234,13 +241,22 @@ void run_dvbs2(config &cfg) {
 
   // TS PACKETS ON STDIN
 
-  pipebuf<tspacket> p_tspackets(&sch, "TS packets", BUF_PACKETS);
+  pipebuf<tspacket> p_tspackets(&sch, "TS packets", BUF_TSPACKETS);
   file_reader<tspacket> r_stdin(&sch, 0, p_tspackets);
+
+  // GSE PACKETS
+
+  pipebuf<u8> p_gsepackets(&sch, "GSE packets", BUF_GSEPACKETS);
+  file_reader<u8> r_gsefd(&sch, cfg.fd_gse, p_gsepackets);
 
   // MODE ADAPTATION
 
   pipebuf<bbframe> p_bbframes(&sch, "Scr BB frames", BUF_FRAMES);
-  s2_framer r_framer(&sch, p_tspackets, p_bbframes);
+  s2_framer r_framer(&sch, p_tspackets, p_gsepackets, p_bbframes);
+  r_framer.fr_total = cfg.bb_total;
+  r_framer.fr_gse = cfg.bb_gse;
+  if(sch.debug) fprintf(stderr, "GSE bandwidth allocation: %.2f %%\n", (float)cfg.bb_gse * 100 / cfg.bb_total);
+  if(sch.debug) fprintf(stderr, "TS bandwidth allocation: %.2f %%\n", (float)(cfg.bb_total - cfg.bb_gse) * 100 / cfg.bb_total);
   r_framer.pls_seq = cfg.pls_seq;
   r_framer.n_pls_seq = cfg.n_pls_seq;
   if      ( cfg.rolloff > 0.40 )  r_framer.rolloff_code = 3;
@@ -374,6 +390,11 @@ void usage(const char *name, FILE *f, int c, const char *info=NULL) {
      "  -v                Output debugging info at startup and exit\n"
      "  -d                Output debugging info during operation\n"
      "  --version         Display version and exit\n"
+     "  --buf-factor INT  Buffer size factor (default:4)\n"
+     "  --fd-gse FDNUM    Read DVB-S2 generic streams from file descriptor\n"
+     "  --f-gse PATH      Read DVB-S2 generic streams from file\n"
+     "  --bb-total INT    Total BBFRAMES, for GSE bandwidth sharing\n"
+     "  --bb-gse INT      BBFRAMES dedicated to GSE, for GSE bandwidth sharing (bb-gse must be < bb-total)\n"
      );
   if ( info ) fprintf(f, "** Error while processing '%s'\n", info);
   exit(c);
@@ -403,6 +424,35 @@ int main(int argc, char *argv[]) {
     }
     else if ( ! strcmp(argv[i], "--buf-factor") && i+1<argc )
       cfg.buf_factor = atoi(argv[++i]);
+    else if ( ! strcmp(argv[i], "--f-gse") && i+1<argc )
+    {
+      int fd = open(argv[++i], O_RDONLY);
+
+      if(fd < 0)
+        fail("open gse file");
+
+      cfg.fd_gse = fd;
+    }
+    else if ( ! strcmp(argv[i], "--fd-gse") && i+1<argc )
+      cfg.fd_gse = atoi(argv[++i]);
+    else if ( ! strcmp(argv[i], "--bb-total") && i+1<argc )
+    {
+      int bb_total = atoi(argv[++i]);
+
+      if(bb_total < 1)
+        fail("bb-total must be at least 1");
+
+      cfg.bb_total = bb_total;
+    }
+    else if ( ! strcmp(argv[i], "--bb-gse") && i+1<argc )
+    {
+      int bb_gse = atoi(argv[++i]);
+
+      if(bb_gse >= cfg.bb_total)
+        fail("bb-gse must be < bb-total");
+
+      cfg.bb_gse = bb_gse;
+    }
     else if ( ! strcmp(argv[i], "--cr") && i+1<argc ) {
       ++i;
       int f;
@@ -459,6 +509,9 @@ int main(int argc, char *argv[]) {
     else 
       usage(argv[0], stderr, 1, argv[i]);
   }
+
+  if(cfg.bb_gse == 0)
+    cfg.bb_total = 1;
 
   switch ( cfg.standard ) {
   case config::DVB_S:  run_dvbs(cfg); break;
