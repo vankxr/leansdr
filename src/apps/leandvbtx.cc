@@ -249,6 +249,14 @@ void run_dvbs2(config &cfg) {
   pipebuf<u8> p_gsepackets(&sch, "GSE packets", BUF_GSEPACKETS);
   file_reader<u8> r_gsefd(&sch, cfg.fd_gse, p_gsepackets);
 
+  if(cfg.fd_gse > -1 && lseek(cfg.fd_gse, 0, SEEK_CUR) < 0 && errno == ESPIPE && fcntl(cfg.fd_gse, F_SETPIPE_SZ, BUF_GSEPACKETS) < 0)
+  {
+    fprintf(stderr,
+      "*** Failed to increase pipe size.\n"
+      "*** Try echo %lu > /proc/sys/fs/pipe-max-size\n", BUF_GSEPACKETS);
+    fatal("F_SETPIPE_SZ");
+  }
+
   // MODE ADAPTATION
 
   pipebuf<bbframe> p_bbframes(&sch, "Scr BB frames", BUF_FRAMES);
@@ -426,7 +434,7 @@ int main(int argc, char *argv[]) {
       cfg.buf_factor = atoi(argv[++i]);
     else if ( ! strcmp(argv[i], "--f-gse") && i+1<argc )
     {
-      int fd = open(argv[++i], O_RDONLY);
+      int fd = open(argv[++i], O_RDONLY | O_CREAT, 0644);
 
       if(fd < 0)
         fail("open gse file");

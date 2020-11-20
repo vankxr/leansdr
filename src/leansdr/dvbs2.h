@@ -2263,22 +2263,22 @@ namespace leansdr {
     bool send_frame(fecframe<SOFTBYTE> *pin) {
       pool *p = get_pool(&pin->pls);
       for ( int i=0; i<p->nprocs; ++i ) {
-	helper_instance *h = &p->procs[i];
-	size_t iosize = (pin->pls.framebits()/8) * sizeof(SOFTBYTE);
-	// fprintf(stderr, "Writing %lu to fd %d\n", iosize, h->fd_tx);
-	int nw = write(h->fd_tx, pin->bytes, iosize);
-	if ( nw<0 && errno==EWOULDBLOCK ) continue;
-	if ( nw < 0 ) fatal("write(LDPC helper");
-	if ( nw != iosize ) fatal("partial write(LDPC helper)");
-	helper_job *job = jobs.put();
-	job->pls = pin->pls;
-	job->h = h;
-	++h->b_in;
-	if ( h->b_in >= h->batch_size ) {
-	  h->b_in -= h->batch_size;
-	  h->b_out += h->batch_size;
-	}
-	return true;
+        helper_instance *h = &p->procs[i];
+        size_t iosize = (pin->pls.framebits()/8) * sizeof(SOFTBYTE);
+        // fprintf(stderr, "Writing %lu to fd %d\n", iosize, h->fd_tx);
+        int nw = write(h->fd_tx, pin->bytes, iosize);
+        if ( nw<0 && errno==EWOULDBLOCK ) continue;
+        if ( nw < 0 ) fatal("write(LDPC helper");
+        if ( nw != iosize ) fatal("partial write(LDPC helper)");
+        helper_job *job = jobs.put();
+        job->pls = pin->pls;
+        job->h = h;
+        ++h->b_in;
+        if ( h->b_in >= h->batch_size ) {
+          h->b_in -= h->batch_size;
+          h->b_out += h->batch_size;
+        }
+        return true;
       }
       return false;
     }
@@ -2545,7 +2545,7 @@ namespace leansdr {
 		pipebuf<unsigned long> *_locktime_out=NULL)
       : runnable(sch, "S2 deframer"),
 	nleftover(-1),
-	in(_in), out_ts(_out_ts,MAX_TS_PER_BBFRAME), out_gse(_out_gse),
+	in(_in), out_ts(_out_ts,MAX_TS_PER_BBFRAME), out_gse(_out_gse,MAX_GSE_PER_BBFRAME),
 	current_state(false),
 	state_out(opt_writer(_state_out,2)),
 	report_state(true),
@@ -2553,71 +2553,74 @@ namespace leansdr {
 	locktime_out(opt_writer(_locktime_out,MAX_TS_PER_BBFRAME))
     { }
     void run() {
-      while ( in.readable()>=1 && out_ts.writable()>=MAX_TS_PER_BBFRAME &&
-	      opt_writable(state_out,2) &&
-	      opt_writable(locktime_out,MAX_TS_PER_BBFRAME) ) {
-	if ( report_state ) {
-	  // Report unlocked state on first invocation.
-	  opt_write(state_out, 0);
-	  report_state = false;
-	}
-	run_bbframe(in.rd());
-	in.read(1);
+      while ( in.readable()>=1 ) {
+        uint8_t *bbh = in.rd()->bytes;
+        // EN 302 307 section 5.1.6 Base-Band Header Insertion
+        uint8_t streamtype = bbh[0] >> 6;
+        bool sis = bbh[0] & 32;
+        bool ccm = bbh[0] & 16;
+        bool issyi = bbh[0] & 8;
+        bool npd = bbh[0] & 4;
+        int ro_code = bbh[0] & 3;
+        uint8_t isi = bbh[1];  // if !sis
+        uint16_t upl = (bbh[2]<<8) | bbh[3];
+        uint16_t dfl = (bbh[4]<<8) | bbh[5];
+        uint8_t sync = bbh[6];
+        uint16_t syncd = (bbh[7]<<8) | bbh[8];
+        uint8_t crcexp = crc8.compute(bbh, 9);
+        uint8_t crc = bbh[9];
+        uint8_t *data = bbh + 10;
+        if ( sch->debug2 ) {
+          static const char *stnames[] = { "GP", "GC", "??", "TS" };
+          static float ro_values[] = { 0.35, 0.25, 0.20, 0 };
+          fprintf(stderr, "BBH: crc %02x/%02x(%s) %s %s(ISI=%d) %s%s%s ro=%.2f"
+            " upl=%d dfl=%d sync=%02x syncd=%d\n",
+            crc, crcexp, (crc==crcexp)?"OK":"KO",
+            stnames[streamtype], (sis?"SIS":"MIS"), isi,
+            (ccm?"CCM":"ACM"), (issyi?" ISSYI":""), (npd?" NPD":""),
+            ro_values[ro_code],
+            upl, dfl, sync, syncd);
+        }
+        if ( crc!=crcexp || dfl>fec_info::KBCH_MAX ) {
+          // Note: Maybe accept syncd=65535
+          fprintf(stderr, "Bad bbframe\n");
+          nleftover = -1;
+          info_unlocked();
+          return;  // Max one state_out per loop
+        }
+        // TBD: Supporting byte-oriented payloads only.
+        if ( (dfl&7) || (syncd&7) ) {
+          fprintf(stderr, "Unsupported bbframe\n");
+          nleftover = -1;
+          info_unlocked();
+          return;  // Max one state_out per loop
+        }
+        if ( streamtype == 1 && upl==0)
+        {
+          if(out_gse.writable() >= dfl/8)
+            for(uint16_t i = 0; i < dfl/8; i++)
+              out_gse.write(data[i]);
+          else
+            break;
+        }
+        else if ( streamtype==3 && upl==188*8 && sync==0x47 && syncd<=dfl)
+          if(out_ts.writable()>=MAX_TS_PER_BBFRAME && opt_writable(state_out,2) && opt_writable(locktime_out,MAX_TS_PER_BBFRAME))
+            handle_ts(data, dfl, syncd, sync);
+          else
+            break;
+        else
+          fprintf(stderr, "Unrecognized bbframe\n");
+
+      	in.read(1);
       }
     }
   private:
-    void run_bbframe(bbframe *pin) {
-      uint8_t *bbh = pin->bytes;
-      // EN 302 307 section 5.1.6 Base-Band Header Insertion
-      uint8_t streamtype = bbh[0] >> 6;
-      bool sis = bbh[0] & 32;
-      bool ccm = bbh[0] & 16;
-      bool issyi = bbh[0] & 8;
-      bool npd = bbh[0] & 4;
-      int ro_code = bbh[0] & 3;
-      uint8_t isi = bbh[1];  // if !sis
-      uint16_t upl = (bbh[2]<<8) | bbh[3];
-      uint16_t dfl = (bbh[4]<<8) | bbh[5];
-      uint8_t sync = bbh[6];
-      uint16_t syncd = (bbh[7]<<8) | bbh[8];
-      uint8_t crcexp = crc8.compute(bbh, 9);
-      uint8_t crc = bbh[9];
-      uint8_t *data = bbh + 10;
-      if ( sch->debug2 ) {
-	static const char *stnames[] = { "GP", "GC", "??", "TS" };
-	static float ro_values[] = { 0.35, 0.25, 0.20, 0 };
-	fprintf(stderr, "BBH: crc %02x/%02x(%s) %s %s(ISI=%d) %s%s%s ro=%.2f"
-		" upl=%d dfl=%d sync=%02x syncd=%d\n",
-		crc, crcexp, (crc==crcexp)?"OK":"KO",
-		stnames[streamtype], (sis?"SIS":"MIS"), isi,
-		(ccm?"CCM":"ACM"), (issyi?" ISSYI":""), (npd?" NPD":""),
-		ro_values[ro_code],
-		upl, dfl, sync, syncd);
-      }
-      if ( crc!=crcexp || dfl>fec_info::KBCH_MAX ) {
-	// Note: Maybe accept syncd=65535
-	fprintf(stderr, "Bad bbframe\n");
-	nleftover = -1;
-	info_unlocked();
-	return;  // Max one state_out per loop
-      }
-      // TBD: Supporting byte-oriented payloads only.
-      if ( (dfl&7) || (syncd&7) ) {
-	fprintf(stderr, "Unsupported bbframe\n");
-	nleftover = -1;
-	info_unlocked();
-	return;  // Max one state_out per loop
-      }
-      if ( streamtype==3 && upl==188*8 && sync==0x47 && syncd<=dfl)
-	handle_ts(data, dfl, syncd, sync);
-      else if ( streamtype == 1 ) {
-        for(uint16_t i = 0; i < dfl/8; i++)
-          out_gse.write(data[i]);
-      } else {
-	fprintf(stderr, "Unrecognized bbframe\n");
-      }
-    }
     void handle_ts(uint8_t *data, uint16_t dfl, uint16_t syncd, uint8_t sync) {
+      if ( report_state ) {
+            // Report unlocked state on first invocation.
+            opt_write(state_out, 0);
+            report_state = false;
+        }
       int pos;  // Start of useful data in this bbframe
       if ( nleftover < 0 ) {
 	// Not synced. Skip unusable data at beginning of bbframe.
@@ -2681,6 +2684,7 @@ namespace leansdr {
                     // 188     =  waiting for CRC
     uint8_t leftover[188];
     static const int MAX_TS_PER_BBFRAME = fec_info::KBCH_MAX/8/188 + 1;
+    static const int MAX_GSE_PER_BBFRAME = fec_info::KBCH_MAX/8 + 1;
     bool locked;
     pipereader<bbframe> in;
     pipewriter<tspacket> out_ts;

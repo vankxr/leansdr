@@ -585,6 +585,14 @@ struct runtime_common {
     new file_writer<tspacket>(sch, *p_tspackets, 1);
     new file_writer<u8>(sch, *p_gsepackets, cfg.fd_gse);
 
+    if(cfg.fd_gse > -1 && lseek(cfg.fd_gse, 0, SEEK_CUR) < 0 && errno == ESPIPE && fcntl(cfg.fd_gse, F_SETPIPE_SZ, BUF_S2GSEPACKETS) < 0)
+    {
+      fprintf(stderr,
+        "*** Failed to increase pipe size.\n"
+        "*** Try echo %lu > /proc/sys/fs/pipe-max-size\n", BUF_S2GSEPACKETS);
+      fatal("F_SETPIPE_SZ");
+    }
+
     // BER ESTIMATION
 
     p_vber = new pipebuf<float>(sch, "VBER", BUF_SLOW);
@@ -1611,7 +1619,7 @@ int main(int argc, const char *argv[]) {
       cfg.fd_pp = atoi(argv[++i]);
     else if ( ! strcmp(argv[i], "--f-gse") && i+1<argc )
     {
-      int fd = open(argv[++i], O_WRONLY);
+      int fd = open(argv[++i], O_WRONLY | O_CREAT, 0644);
 
       if(fd < 0)
         fail("open gse file");
