@@ -68,3 +68,10 @@ embedded:	LDFLAGS+=-static
 
 clean:
 	rm -f $(APPS:%=$(OUTDIR)/%)
+
+install:
+	install -m 0755 leandvb $(PREFIX)/bin
+	install -m 0755 leandvbtx $(PREFIX)/bin
+
+uninstall:
+	rm $(PREFIX)/bin/leandvb $(PREFIX)/bin/leandvbtx
