@@ -109,8 +109,8 @@ struct config
     int fd_spectrum; // FD for spectrum data, or -1
     bool json;       // Use JSON syntax
 
-    config()
-        : verbose(false),
+    config() :
+        verbose(false),
         debug(false),
         debug2(false),
         highspeed(false),
@@ -271,7 +271,7 @@ struct runtime_common
         }
 
         // Min buffer size for TS packets: Up to 39 per BBFRAME
-        unsigned long BUF_S2PACKETS = (fec_info::KBCH_MAX / 188 / 8 + 1) * cfg.buf_factor;
+        unsigned long BUF_S2PACKETS = (fec_info::KBCH_MAX / tspacket::SIZE / 8 + 1) * cfg.buf_factor;
         unsigned long BUF_S2GSEPACKETS = (fec_info::KBCH_MAX / 8 + 1) * cfg.buf_factor;
         // Min buffer size for misc measurements: 1
         unsigned long BUF_SLOW = cfg.buf_factor;
@@ -1626,6 +1626,7 @@ int main(int argc, const char* argv[])
                 if(!strcmp(argv[i], cstln_base::names[c]))
                 {
                     cfg.constellation = (cstln_base::predef)c;
+
                     break;
                 }
             }
@@ -1649,6 +1650,7 @@ int main(int argc, const char* argv[])
                 if(!strcmp(argv[i], fec_names[f]))
                 {
                     cfg.fec = (code_rate)f;
+
                     break;
                 }
             }
