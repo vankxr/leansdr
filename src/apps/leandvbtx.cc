@@ -18,6 +18,14 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#ifdef GSE
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#endif
 #include <math.h>
 
 #include "leansdr/framework.h"
@@ -68,7 +76,7 @@ private:
 
 struct config
 {
-    bool verbose, debug;
+    bool verbose, debug, debug2;
     enum dvb_version
     {
         DVB_S,
@@ -81,7 +89,7 @@ struct config
     static const int MAX_PLS_SEQ = 256;
     s2_pls pls_seq[MAX_PLS_SEQ];
     int n_pls_seq;
-    int fd_gse; // FD for DVB-S2 Generic streams, or -1
+    int fd_tun; // FD of tunnel interface for DVB-S2 Generic streams, or -1
     int bb_total;
     int bb_gse;
     // Common
@@ -101,8 +109,9 @@ struct config
     config() :
         verbose(false),
         debug(false),
+        debug2(false),
         standard(DVB_S),
-        fd_gse(-1),
+        fd_tun(-1),
         bb_total(1),
         bb_gse(0),
         buf_factor(4),
@@ -125,6 +134,34 @@ struct config
         n_pls_seq = 1; // CCM
     }
 };
+
+#ifdef GSE
+int tun_alloc(char* dev, int flags)
+{
+    struct ifreq ifr;
+    int fd, err;
+
+    if((fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK)) < 0)
+        fail("Opening /dev/net/tun");
+
+    memset(&ifr, 0, sizeof(ifr));
+
+    ifr.ifr_flags = flags;
+
+    if(*dev)
+        strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
+
+    if((err = ioctl(fd, TUNSETIFF, (void*)&ifr)) < 0)
+    {
+        close(fd);
+        fail("ioctl(TUNSETIFF)");
+    }
+
+    strcpy(dev, ifr.ifr_name);
+
+    return fd;
+}
+#endif
 
 void run_dvbs(config& cfg)
 {
@@ -265,9 +302,10 @@ void run_dvbs2(config& cfg)
     scheduler sch;
     sch.verbose = cfg.verbose;
     sch.debug = cfg.debug;
+    sch.debug2 = cfg.debug2;
 
     unsigned long BUF_TSPACKETS = (64800 / 8 + tspacket::SIZE - 1) / tspacket::SIZE * cfg.buf_factor * 2;
-    unsigned long BUF_GSEPACKETS = (64800 / 8) * cfg.buf_factor * 2;
+    unsigned long BUF_IPPACKETS = 1024 * cfg.buf_factor;
     unsigned long BUF_FRAMES = cfg.buf_factor;
     unsigned long BUF_SLOTS = (1 + modcod_info::MAX_SLOTS_PER_FRAME) * cfg.buf_factor;
     unsigned long BUF_SYMBOLS = modcod_info::MAX_SYMBOLS_PER_FRAME * cfg.buf_factor;
@@ -278,25 +316,17 @@ void run_dvbs2(config& cfg)
     pipebuf<tspacket> p_tspackets(&sch, "TS packets", BUF_TSPACKETS);
     file_reader<tspacket> r_stdin(&sch, 0, p_tspackets);
 
-    // GSE PACKETS
+    // IP PACKETS ON TUN FD
 
-    pipebuf<u8> p_gsepackets(&sch, "GSE packets", BUF_GSEPACKETS);
-    file_reader<u8> r_gsefd(&sch, cfg.fd_gse, p_gsepackets);
+    pipebuf<ippacket> p_ippackets(&sch, "IP (GSE) packets", BUF_IPPACKETS);
+    file_reader<ippacket> r_tunfd(&sch, cfg.fd_tun, p_ippackets);
 
-    if(cfg.fd_gse > -1 && lseek(cfg.fd_gse, 0, SEEK_CUR) < 0 && errno == ESPIPE && fcntl(cfg.fd_gse, F_SETPIPE_SZ, BUF_GSEPACKETS) < 0)
-    {
-        fprintf(stderr,
-            "*** Failed to increase pipe size.\n"
-            "*** Try echo %lu > /proc/sys/fs/pipe-max-size\n",
-            BUF_GSEPACKETS);
-
-        fatal("F_SETPIPE_SZ");
-    }
+    r_tunfd.tunnel_mode = true;
 
     // MODE ADAPTATION
 
     pipebuf<bbframe> p_bbframes(&sch, "Scr BB frames", BUF_FRAMES);
-    s2_framer r_framer(&sch, p_tspackets, p_gsepackets, p_bbframes);
+    s2_framer r_framer(&sch, p_tspackets, p_ippackets, p_bbframes);
     r_framer.fr_total = cfg.bb_total;
     r_framer.fr_gse = cfg.bb_gse;
 
@@ -453,12 +483,16 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "  -d                Output debugging info during operation\n"
         "  --version         Display version and exit\n"
         "  --buf-factor INT  Buffer size factor (default:4)\n"
-        "  --fd-gse FDNUM    Read DVB-S2 generic streams from file descriptor\n"
-        "  --f-gse PATH      Read DVB-S2 generic streams from file\n"
+#ifdef GSE
+        "  --ip-tun NAME     Read IP packets from this interface and send via DVB-S2 generic stream (GSE), create it if does not exist\n"
         "  --bb-total INT    Total BBFRAMES, for GSE bandwidth sharing\n"
-        "  --bb-gse INT      BBFRAMES dedicated to GSE, for GSE bandwidth sharing (bb-gse must be < bb-total)\n");
+        "  --bb-gse INT      BBFRAMES dedicated to GSE, for GSE bandwidth sharing (bb-gse must be < bb-total)\n"
+#endif
+        );
+
     if(info)
         fprintf(f, "** Error while processing '%s'\n", info);
+
     exit(c);
 }
 
@@ -473,7 +507,10 @@ int main(int argc, char* argv[])
         else if(!strcmp(argv[i], "-v"))
             cfg.verbose = true;
         else if(!strcmp(argv[i], "-d"))
+        {
+            cfg.debug2 = cfg.debug;
             cfg.debug = true;
+        }
         else if(!strcmp(argv[i], "--version"))
         {
             printf("%s\n", VERSION);
@@ -492,17 +529,22 @@ int main(int argc, char* argv[])
         }
         else if(!strcmp(argv[i], "--buf-factor") && i + 1 < argc)
             cfg.buf_factor = atoi(argv[++i]);
-        else if(!strcmp(argv[i], "--f-gse") && i + 1 < argc)
+#ifdef GSE
+        else if(!strcmp(argv[i], "--ip-tun") && i + 1 < argc)
         {
-            int fd = open(argv[++i], O_RDONLY | O_CREAT, 0644);
+            char tunname[IFNAMSIZ];
+
+            strncpy(tunname, argv[++i], IFNAMSIZ - 1);
+
+            int fd = tun_alloc(tunname, IFF_TUN | IFF_MULTI_QUEUE);
 
             if(fd < 0)
-                fail("open gse file");
+                fail("open/create tunnel interface");
 
-            cfg.fd_gse = fd;
+            fprintf(stderr, "Created tunnel interface %s\n", tunname);
+
+            cfg.fd_tun = fd;
         }
-        else if(!strcmp(argv[i], "--fd-gse") && i + 1 < argc)
-            cfg.fd_gse = atoi(argv[++i]);
         else if(!strcmp(argv[i], "--bb-total") && i + 1 < argc)
         {
             int bb_total = atoi(argv[++i]);
@@ -521,6 +563,7 @@ int main(int argc, char* argv[])
 
             cfg.bb_gse = bb_gse;
         }
+#endif
         else if(!strcmp(argv[i], "--cr") && i + 1 < argc)
         {
             ++i;

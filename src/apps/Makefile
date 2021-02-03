@@ -28,9 +28,18 @@ APPS	+= leandvbtx leandvb
 APPS	+= leansdrscan leansdrserv
 APPS	+= leantsgen leansdrcat leanchansim
 
+
+ifneq "$(wildcard /usr/local/include/gse/*.h)" ""
+CXXFLAGS	+= -DGSE
+$(OUTDIR)/leandvb:		LDFLAGS_APP+=-lgse
+$(OUTDIR)/leandvbtx:	LDFLAGS_APP+=-lgse
+else
+$(info libgse not found. Will not support GSE TX/RX.)
+endif
+
 ifneq "$(wildcard /usr/include/X11/Xlib.h)" ""
-$(OUTDIR)/leandvb:	CXXFLAGS_APP=-DGUI
-$(OUTDIR)/leandvb:	LDFLAGS_APP=-lX11
+$(OUTDIR)/leandvb:	CXXFLAGS_APP+=-DGUI
+$(OUTDIR)/leandvb:	LDFLAGS_APP+=-lX11
 else
 $(info libX11 not found. Will not support --gui.)
 endif
@@ -39,7 +48,7 @@ endif
 ifneq "$(wildcard /usr/include/fftw3.h)" ""
 ifneq "$(wildcard /usr/include/pthread.h)" ""
 APPS	+= leanmlmrx
-$(OUTDIR)/leanmlmrx:	LDFLAGS_APP=-lfftw3f -lpthread
+$(OUTDIR)/leanmlmrx:	LDFLAGS_APP+=-lfftw3f -lpthread
 else
 $(info libpthread not found. Will not build leanmlmrx.)
 endif

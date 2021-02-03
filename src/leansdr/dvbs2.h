@@ -20,6 +20,16 @@
 #ifndef LEANSDR_DVBS2_H
 #define LEANSDR_DVBS2_H
 
+#ifdef GSE
+extern "C" {
+    #include <gse/constants.h>
+    #include <gse/encap.h>
+    #include <gse/deencap.h>
+    #include <gse/refrag.h>
+}
+#endif // GSE
+
+#include <arpa/inet.h>
 #include "leansdr/sdr.h"
 #include "leansdr/softword.h"
 #include "leansdr/dvb.h"
@@ -2418,10 +2428,33 @@ namespace leansdr
       },
     };
 
+    struct bbheader
+    {
+        u8 ro : 2;
+        u8 npd : 1;
+        u8 issyi : 1;
+        u8 ccm : 1;
+        u8 sis : 1;
+        static const u8 STREAM_TYPE_GENERIC_PACKETIZED = 0;
+        static const u8 STREAM_TYPE_GENERIC_CONTINUOUS = 1;
+        static const u8 STREAM_TYPE_TRANSPORT = 3;
+        u8 stream_type : 2;
+        u8 isi;
+        u16 upl;
+        u16 dfl;
+        u8 sync;
+        u16 syncd;
+        u8 crc;
+    } __attribute__((packed));
+
     struct bbframe
     {
         s2_pls pls;
-        uint8_t bytes[58192 / 8];  // Kbch/8 max
+        union
+        {
+            bbheader header;
+            uint8_t bytes[58192 / 8];  // Kbch/8 max
+        };
     };
 
     // S2_LDPC_ENGINES
@@ -3004,10 +3037,10 @@ namespace leansdr
 
     struct ippacket
     {
-        static const int GSE_MAX_PAYLOAD = 4096;
+        static const int TUN_INTERFACE_MTU = 65000; // MTU includes flags & protocol
         u16 flags;
         u16 protocol;
-        u8 data[GSE_MAX_PAYLOAD];
+        u8 data[TUN_INTERFACE_MTU - 4];
         ssize_t size;
     };
 
@@ -3024,7 +3057,7 @@ namespace leansdr
         int fr_total; // total bbframes
         int fr_gse; // frames dedicated to gse data (fr_gse < fr_total)
 
-        s2_framer(scheduler* sch, pipebuf<tspacket>& _in_ts, pipebuf<u8>& _in_gse, pipebuf<bbframe>& _out) :
+        s2_framer(scheduler* sch, pipebuf<tspacket>& _in_ts, pipebuf<ippacket>& _in_ip, pipebuf<bbframe>& _out) :
             runnable(sch, "S2 framer"),
             n_pls_seq(0),
             fr_total(1),
@@ -3032,11 +3065,20 @@ namespace leansdr
             pls_index(0),
             fr_index(0),
             in_ts(_in_ts),
-            in_gse(_in_gse),
+            in_ip(_in_ip),
             out(_out)
         {
             nremain = 0;
             remcrc = 0;  // CRC for nonexistent previous packet
+#ifdef GSE
+            gse_status_t ret = gse_encap_init(4, 16, &encap);
+
+            if(ret > GSE_STATUS_OK)
+            {
+                fprintf(stderr, "Fail to initialize GSE encapsulation library: %s", gse_get_status(ret));
+                fail("Fail to initialize GSE encapsulation library");
+            }
+#endif
         }
 
         void run()
@@ -3055,53 +3097,160 @@ namespace leansdr
                     fail("MODCOD/framesize combination not allowed");
 
                 bbframe* pout = out.wr();
+                bbheader* header = &pout->header;
+                uint8_t* data = pout->bytes + sizeof(bbheader);
+                uint8_t* end = pout->bytes + framebytes;
                 pout->pls = *pls;
-
-                uint8_t* buf = pout->bytes;
-                uint8_t* end = buf + framebytes;
 
                 if(fr_index < fr_gse)
                 {
-                    size_t gse_readable = in_gse.readable();
+#ifdef GSE
+                    uint16_t avail = framebytes - 10;
 
-                    if(gse_readable > framebytes - 10)
-                        gse_readable = framebytes - 10;
+                    gse_status_t ret;
 
-                    // EN 302 307-1 section 5.1.6 Base-Band Header insertion
-                    uint8_t* bbheader = buf;
-                    uint8_t matype1 = 0;
-                    matype1 |= 0x40;  // Generic continuous
-                    matype1 |= 0x20;  // SIS
-                    matype1 |= (n_pls_seq == 1) ? 0x10 : 0x00;  // CCM/ACM (TBD ISSY/NPD required for ACM ?)
-                    matype1 |= rolloff_code;
-                    *buf++ = matype1;              // MATYPE-1
-                    *buf++ = 0;                    // MATYPE-2
-                    uint16_t upl = 0;
-                    *buf++ = upl >> 8;             // UPL MSB
-                    *buf++ = upl;                  // UPL LSB
-                    uint16_t dfl = gse_readable * 8;
-                    *buf++ = dfl >> 8;             // DFL MSB
-                    *buf++ = dfl;                  // DFL LSB
-                    *buf++ = 0x00;                 // SYNC
-                    uint16_t syncd = 0;
-                    *buf++ = syncd >> 8;           // SYNCD MSB
-                    *buf++ = syncd;                // SYNCD LSB
-                    *buf++ = crc8.compute(bbheader, 9);
-
-                    // Data field
-                    for(size_t i = 0; i < framebytes - 10; i++)
+                    // Check if we left data that did not fit in the previous BBFRAME
+                    while(avail)
                     {
-                        if(i < gse_readable)
+                        gse_vfrag_t* gse_pkt_vfrag;
+
+                        ret = gse_encap_get_packet(&gse_pkt_vfrag, encap, min((uint16_t)GSE_MAX_PACKET_LENGTH, avail), 0);
+                        if(ret == GSE_STATUS_OK)
                         {
-                            u8* gsep = in_gse.rd();
-                            *buf++ = *gsep;
-                            in_gse.read(1);
+                            size_t gse_pkt_size = gse_get_vfrag_length(gse_pkt_vfrag);
+
+                            if(sch->debug2)
+                                fprintf(stderr, "GSE: Got a packet with %lu bytes from previous run\n", gse_pkt_size);
+
+                            memcpy(data, gse_get_vfrag_start(gse_pkt_vfrag), gse_pkt_size);
+
+                            data += gse_pkt_size;
+                            avail -= gse_pkt_size;
+
+                            gse_free_vfrag(&gse_pkt_vfrag);
+                        }
+                        else if(ret == GSE_STATUS_FIFO_EMPTY)
+                        {
+                            break;
+                        }
+                        else if(ret == GSE_STATUS_LENGTH_TOO_SMALL)
+                        {
+                            if(sch->debug2)
+                                fprintf(stderr, "GSE: BBFRAME only has %hu bytes available, cannot fit a GSE packet in there\n", avail);
+
+                            break;
                         }
                         else
                         {
-                            *buf++ = 0;
+                            fprintf(stderr, "Error when getting GSE packet: %s\n", gse_get_status(ret));
+                            fail("Error when fetching GSE packet");
                         }
                     }
+
+                    // Feed in more data if we already drained the FIFO, otherwise skip
+                    while(in_ip.readable() && avail && ret != GSE_STATUS_LENGTH_TOO_SMALL)
+                    {
+                        ippacket* pkt = in_ip.rd();
+                        uint8_t* pdu = pkt->data;
+                        ssize_t pdu_size = pkt->size - 4; // Tunnel header size
+
+                        gse_vfrag_t* pdu_vfrag;
+
+                        ret = gse_create_vfrag_with_data(&pdu_vfrag, pdu_size, GSE_MAX_HEADER_LENGTH, GSE_MAX_TRAILER_LENGTH, pdu, pdu_size);
+                        if(ret > GSE_STATUS_OK)
+                        {
+                            fprintf(stderr, "Error when creating PDU virtual fragment: %s\n", gse_get_status(ret));
+                            fail("Error when creating PDU virtual fragment");
+                        }
+
+                        ret = gse_encap_receive_pdu(pdu_vfrag, encap, NULL, GSE_LT_NO_LABEL, ntohs(pkt->protocol), 0);
+                        if(ret > GSE_STATUS_OK)
+                        {
+                            fprintf(stderr, "Error when encapsulating PDU: %s\n", gse_get_status(ret));
+                            fail("Error when encapsulating PDU");
+                        }
+
+                        if(sch->debug2)
+                            fprintf(stderr, "GSE: Ingested a PDU with %lu bytes. Protocol: 0x%04X\n", pdu_size, ntohs(pkt->protocol));
+
+                        in_ip.read(1);
+
+                        while(avail)
+                        {
+                            gse_vfrag_t* gse_pkt_vfrag;
+
+                            ret = gse_encap_get_packet(&gse_pkt_vfrag, encap, min((uint16_t)GSE_MAX_PACKET_LENGTH, avail), 0);
+                            if(ret == GSE_STATUS_OK)
+                            {
+                                size_t gse_pkt_size = gse_get_vfrag_length(gse_pkt_vfrag);
+
+                                if(sch->debug2)
+                                    fprintf(stderr, "GSE: Got a packet with %lu bytes\n", gse_pkt_size);
+
+                                memcpy(data, gse_get_vfrag_start(gse_pkt_vfrag), gse_pkt_size);
+
+                                data += gse_pkt_size;
+                                avail -= gse_pkt_size;
+
+                                gse_free_vfrag(&gse_pkt_vfrag);
+                            }
+                            else if(ret == GSE_STATUS_FIFO_EMPTY)
+                            {
+                                if(sch->debug2)
+                                    fprintf(stderr, "GSE: Drained encapsulator FIFO, going to check for more PDUs\n");
+
+                                break;
+                            }
+                            else if(ret == GSE_STATUS_LENGTH_TOO_SMALL)
+                            {
+                                if(sch->debug2)
+                                    fprintf(stderr, "GSE: BBFRAME only has %hu bytes available, cannot fit a GSE packet in there\n", avail);
+
+                                break;
+                            }
+                            else
+                            {
+                                fprintf(stderr, "Error when getting GSE packet: %s\n", gse_get_status(ret));
+                                fail("Error when fetching GSE packet");
+                            }
+                        }
+                    }
+
+                    if(!avail) // BBFRAME was fully filled up with data
+                    {
+                        if(sch->debug2)
+                            fprintf(stderr, "GSE: BBFRAME fully filled\n");
+                    }
+                    else if(ret == GSE_STATUS_LENGTH_TOO_SMALL) // BBFRAME was filled to the max (i.e. there is some space left but we cannot put anything useful in there)
+                    {
+                        if(sch->debug2)
+                            fprintf(stderr, "GSE: BBFRAME filled (best-effort). Remaining %hu bytes\n", avail);
+                    }
+                    else if(avail != framebytes - 10) // BBFRAME has space that could be used but was not due to lack of data
+                    {
+                        if(sch->debug2)
+                            fprintf(stderr, "GSE: BBFRAME space wasted. Remaining %hu bytes\n", avail);
+                    }
+
+                    data += avail; // Required to pass the check below (if(data != end))
+
+                    // EN 302 307-1 section 5.1.6 Base-Band Header insertion
+                    header->stream_type = bbheader::STREAM_TYPE_GENERIC_CONTINUOUS; // Generic continuous
+                    header->sis = 1;                                                // Single stream
+                    header->ccm = (n_pls_seq == 1) ? 1 : 0;                         // CCM/ACM (TBD ISSY/NPD required for ACM ?)
+                    header->issyi = 0;                                              // Input Stream Synchronization Indicator OFF
+                    header->npd = 0;                                                // Null-packet deletion OFF
+                    header->ro = rolloff_code;                                      // Roll-off code
+                    header->isi = 0;                                                // Input Stream Identifier
+                    header->upl = htons(0 * 8);                                     // User Packet Length (0 for Generic continuous)
+                    header->dfl = htons((framebytes - 10 - avail) * 8);             // Data Field Length
+                    header->sync = 0x00;                                            // SYNC - Copy of the user packet Sync byte
+                    header->syncd = htons(0 * 8);                                   // SYNCD
+                    header->crc = crc8.compute(pout->bytes, 9);                     // CRC
+#else
+                    if(sch->debug2)
+                        fprintf(stderr, "GSE: Generating GSE BBFRAME but GSE support is not available\n");
+#endif
                 }
                 else
                 {
@@ -3109,48 +3258,41 @@ namespace leansdr
                         break;  // Not enough data to fill a frame
 
                     // EN 302 307-1 section 5.1.6 Base-Band Header insertion
-                    uint8_t* bbheader = buf;
-                    uint8_t matype1 = 0;
-                    matype1 |= 0xC0;  // TS
-                    matype1 |= 0x20;  // SIS
-                    matype1 |= (n_pls_seq == 1) ? 0x10 : 0x00;  // CCM/ACM (TBD ISSY/NPD required for ACM ?)
-                    matype1 |= rolloff_code;
-                    *buf++ = matype1;              // MATYPE-1
-                    *buf++ = 0;                    // MATYPE-2
-                    uint16_t upl = tspacket::SIZE * 8;
-                    *buf++ = upl >> 8;             // UPL MSB
-                    *buf++ = upl;                  // UPL LSB
-                    uint16_t dfl = (framebytes - 10) * 8;
-                    *buf++ = dfl >> 8;             // DFL MSB
-                    *buf++ = dfl;                  // DFL LSB
-                    *buf++ = MPEG_SYNC;            // SYNC
-                    uint16_t syncd = nremain * 8;
-                    *buf++ = syncd >> 8;           // SYNCD MSB
-                    *buf++ = syncd;                // SYNCD LSB
-                    *buf++ = crc8.compute(bbheader, 9);
+                    header->stream_type = bbheader::STREAM_TYPE_TRANSPORT;  // Transport stream
+                    header->sis = 1;                                        // Single stream
+                    header->ccm = (n_pls_seq == 1) ? 1 : 0;                 // CCM/ACM (TBD ISSY/NPD required for ACM ?)
+                    header->issyi = 0;                                      // Input Stream Synchronization Indicator OFF
+                    header->npd = 0;                                        // Null-packet deletion OFF
+                    header->ro = rolloff_code;                              // Roll-off code
+                    header->isi = 0;                                        // Input Stream Identifier
+                    header->upl = htons(tspacket::SIZE * 8);                // User Packet Length (0 for Generic continuous)
+                    header->dfl = htons((framebytes - 10) * 8);             // Data Field Length
+                    header->sync = MPEG_SYNC;                               // SYNC - Copy of the user packet Sync byte
+                    header->syncd = htons(nremain * 8);                     // SYNCD
+                    header->crc = crc8.compute(pout->bytes, 9);             // CRC
 
                     // Data field
-                    memcpy(buf, rembuf, nremain);  // Leftover from previous runs
-                    buf += nremain;
+                    memcpy(data, rembuf, nremain);  // Leftover from previous runs
+                    data += nremain;
 
-                    while(buf < end)
+                    while(data < end)
                     {
                         tspacket* tsp = in_ts.rd();
 
                         if(tsp->data[0] != MPEG_SYNC)
                             fail("Invalid TS");
 
-                        *buf++ = remcrc;  // Replace SYNC with CRC of previous.
+                        *data++ = remcrc;  // Replace SYNC with CRC of previous.
                         remcrc = crc8.compute(tsp->data + 1, tspacket::SIZE - 1);
-                        int nused = end - buf;
+                        int nused = end - data;
 
                         if(nused > tspacket::SIZE - 1)
                             nused = tspacket::SIZE - 1;
 
-                        memcpy(buf, tsp->data + 1, nused);
-                        buf += nused;
+                        memcpy(data, tsp->data + 1, nused);
+                        data += nused;
 
-                        if(buf == end)
+                        if(data == end)
                         {
                             nremain = (tspacket::SIZE - 1) - nused;
                             memcpy(rembuf, tsp->data + 1 + nused, nremain);
@@ -3160,7 +3302,7 @@ namespace leansdr
                     }
                 }
 
-                if(buf != end)
+                if(data != end)
                     fail("Bug: s2_framer");
 
                 out.written(1);
@@ -3177,8 +3319,11 @@ namespace leansdr
     private:
         int pls_index;  // Next slot to use in pls_seq
         int fr_index; // current bbframe index
+#ifdef GSE
+        gse_encap_t* encap;
+#endif
         pipereader<tspacket> in_ts;
-        pipereader<u8> in_gse;
+        pipereader<ippacket> in_ip;
         pipewriter<bbframe> out;
         crc8_engine crc8;
         int nremain;
@@ -3186,45 +3331,42 @@ namespace leansdr
         uint8_t remcrc;
     };  // s2_framer
 
-
     // S2 DEFRAMER
     // EN 302 307-1 section 5.1 Mode adaptation
     struct s2_deframer : runnable
     {
-        s2_deframer(scheduler* sch, pipebuf<bbframe>& _in, pipebuf<tspacket>& _out_ts, pipebuf<u8>& _out_gse, pipebuf<int>* _state_out = NULL, pipebuf<unsigned long>* _locktime_out = NULL) :
+        s2_deframer(scheduler* sch, pipebuf<bbframe>& _in, pipebuf<tspacket>& _out_ts, pipebuf<ippacket>& _out_ip, pipebuf<int>* _state_out = NULL, pipebuf<unsigned long>* _locktime_out = NULL) :
             runnable(sch, "S2 deframer"),
             nleftover(-1),
             in(_in),
             out_ts(_out_ts, MAX_TS_PER_BBFRAME),
-            out_gse(_out_gse, MAX_GSE_PER_BBFRAME),
+            out_ip(_out_ip, MAX_IP_PER_BBFRAME),
             current_state(false),
             state_out(opt_writer(_state_out, 2)),
             report_state(true),
             locktime(0),
             locktime_out(opt_writer(_locktime_out, MAX_TS_PER_BBFRAME))
-        {}
+        {
+#ifdef GSE
+            gse_status_t ret = gse_deencap_init(4, &deencap);
+
+            if(ret > GSE_STATUS_OK)
+            {
+                fprintf(stderr, "Fail to initialize GSE deencapsulation library: %s", gse_get_status(ret));
+                fail("Fail to initialize GSE deencapsulation library");
+            }
+#endif
+        }
 
         void run()
         {
             while(in.readable() >= 1)
             {
-                uint8_t* bbh = in.rd()->bytes;
+                bbframe* pin = in.rd();
+                bbheader* header = &pin->header;
+                uint8_t* data = pin->bytes + sizeof(bbheader);
 
-                // EN 302 307 section 5.1.6 Base-Band Header Insertion
-                uint8_t streamtype = bbh[0] >> 6;
-                bool sis = bbh[0] & 32;
-                bool ccm = bbh[0] & 16;
-                bool issyi = bbh[0] & 8;
-                bool npd = bbh[0] & 4;
-                int ro_code = bbh[0] & 3;
-                uint8_t isi = bbh[1];  // if !sis
-                uint16_t upl = (bbh[2] << 8) | bbh[3];
-                uint16_t dfl = (bbh[4] << 8) | bbh[5];
-                uint8_t sync = bbh[6];
-                uint16_t syncd = (bbh[7] << 8) | bbh[8];
-                uint8_t crcexp = crc8.compute(bbh, 9);
-                uint8_t crc = bbh[9];
-                uint8_t* data = bbh + 10;
+                uint8_t crc = crc8.compute(pin->bytes, 9);
 
                 if(sch->debug2)
                 {
@@ -3232,16 +3374,16 @@ namespace leansdr
                     static float ro_values[] = { 0.35, 0.25, 0.20, 0 };
 
                     fprintf(stderr, "BBH: crc %02x/%02x(%s) %s %s(ISI=%d) %s%s%s ro=%.2f upl=%d dfl=%d sync=%02x syncd=%d\n",
-                            crc, crcexp, (crc == crcexp) ? "OK" : "KO",
-                            stnames[streamtype], (sis ? "SIS" : "MIS"), isi,
-                            (ccm ? "CCM" : "ACM"), (issyi ? " ISSYI" : ""), (npd ? " NPD" : ""),
-                            ro_values[ro_code],
-                            upl,
-                            dfl,
-                            sync, syncd);
+                        header->crc, crc, (header->crc == crc) ? "OK" : "KO",
+                        stnames[header->stream_type], (header->sis ? "SIS" : "MIS"), header->isi,
+                        (header->ccm ? "CCM" : "ACM"), (header->issyi ? " ISSYI" : ""), (header->npd ? " NPD" : ""),
+                        ro_values[header->ro],
+                        ntohs(header->upl),
+                        ntohs(header->dfl),
+                        header->sync, ntohs(header->syncd));
                 }
 
-                if(crc != crcexp || dfl > fec_info::KBCH_MAX)
+                if(header->crc != crc || ntohs(header->dfl) > fec_info::KBCH_MAX)
                 {
                     // Note: Maybe accept syncd=65535
                     fprintf(stderr, "Bad bbframe\n");
@@ -3249,38 +3391,34 @@ namespace leansdr
                     nleftover = -1;
                     info_unlocked();
 
-                    return;  // Max one state_out per loop
+                    break;  // Max one state_out per loop
                 }
 
                 // TBD: Supporting byte-oriented payloads only.
-                if((dfl & 7) || (syncd & 7))
+                if((ntohs(header->dfl) & 7) || (ntohs(header->syncd) & 7))
                 {
-                    fprintf(stderr, "Unsupported bbframe\n");
+                    fprintf(stderr, "Unsupported BBFRAME\n");
 
                     nleftover = -1;
                     info_unlocked();
 
-                    return;  // Max one state_out per loop
+                    break;  // Max one state_out per loop
                 }
 
-                if(streamtype == 1 && upl == 0)
+                if(header->stream_type == bbheader::STREAM_TYPE_GENERIC_CONTINUOUS && ntohs(header->upl) == 0)
                 {
-                    if(out_gse.writable() >= dfl / 8)
-                        for(uint16_t i = 0; i < dfl / 8; i++)
-                            out_gse.write(data[i]);
-                    else
-                        break;
+                    handle_gse(data, ntohs(header->dfl));
                 }
-                else if(streamtype == 3 && upl == tspacket::SIZE * 8 && sync == MPEG_SYNC && syncd <= dfl)
+                else if(header->stream_type == bbheader::STREAM_TYPE_TRANSPORT && ntohs(header->upl) == tspacket::SIZE * 8 && header->sync == MPEG_SYNC && ntohs(header->syncd) <= ntohs(header->dfl))
                 {
-                    if(out_ts.writable() >= MAX_TS_PER_BBFRAME && opt_writable(state_out, 2) && opt_writable(locktime_out, MAX_TS_PER_BBFRAME))
-                        handle_ts(data, dfl, syncd, sync);
-                    else
+                    if(out_ts.writable() < MAX_TS_PER_BBFRAME || !opt_writable(state_out, 2) || !opt_writable(locktime_out, MAX_TS_PER_BBFRAME))
                         break;
+
+                    handle_ts(data, ntohs(header->dfl), ntohs(header->syncd), header->sync);
                 }
                 else
                 {
-                    fprintf(stderr, "Unrecognized bbframe\n");
+                    fprintf(stderr, "Unrecognized BBFRAME\n");
                 }
 
                 in.read(1);
@@ -3360,6 +3498,112 @@ namespace leansdr
             memcpy(leftover + nleftover, data + pos, remain);
             nleftover += remain;
         }
+        void handle_gse(uint8_t* data, uint16_t dfl)
+        {
+#ifdef GSE
+            gse_status_t ret;
+
+            gse_deencap_new_bbframe(deencap); // Only inform deencapsulator of GSE related BBFRAMES (FIXME: should we also inform of other BBFRAMES?)
+
+            uint16_t done = 0;
+            dfl /= 8;
+
+            while(done < dfl)
+            {
+                gse_vfrag_t* gse_pkt_vfrag;
+
+                ret = gse_create_vfrag_with_data(&gse_pkt_vfrag, dfl - done, 0, 0, data + done, dfl - done);
+                if(ret > GSE_STATUS_OK)
+                {
+                    fprintf(stderr, "Error when creating GSE packet virtual fragment: %s\n", gse_get_status(ret));
+                    fail("Error when creating GSE packet virtual fragment");
+                }
+
+                uint16_t gse_pkt_size;
+
+                uint8_t label_type;
+                uint8_t label[6];
+                uint16_t protocol;
+                gse_vfrag_t* pdu_vfrag;
+
+                ret = gse_deencap_packet(gse_pkt_vfrag, deencap, &label_type, label, &protocol, &pdu_vfrag, &gse_pkt_size);
+                if(ret == GSE_STATUS_OK)
+                {
+                    if(sch->debug2)
+                        fprintf(stderr, "GSE: Consumed %hu bytes from BBFRAME, no PDU received\n", gse_pkt_size);
+                }
+                else if(ret == GSE_STATUS_PDU_RECEIVED)
+                {
+                    if(sch->debug2)
+                        fprintf(stderr, "GSE: Consumed %hu bytes from BBFRAME, PDU received\n", gse_pkt_size);
+
+                    size_t pdu_size = gse_get_vfrag_length(pdu_vfrag);
+
+                    if(sch->debug2)
+                    {
+                        static const char *label_types[] = {"6-Byte", "3-Byte", "No label", "Label re-use"};
+                        char label_str[32] = "";
+
+                        if(label_type == GSE_LT_6_BYTES)
+                            snprintf(label_str, 32, "Label: %02X:%02X:%02X:%02X:%02X:%02X.", label[0], label[1], label[2], label[3], label[4], label[5]);
+                        else if(label_type == GSE_LT_3_BYTES)
+                            snprintf(label_str, 32, "Label: %02X:%02X:%02X.", label[0], label[1], label[2]);
+
+                        fprintf(stderr, "GSE: Got PDU of size %lu bytes. Protocol: 0x%04X. Label type: %s.%s\n", pdu_size, protocol, label_types[label_type], label_str);
+                    }
+
+                    if(pdu_size <= ippacket::TUN_INTERFACE_MTU - 4)
+                    {
+                        if(out_ip.writable())
+                        {
+                            ippacket* pkt = out_ip.wr();
+
+                            pkt->flags = 0x0000;
+                            pkt->protocol = htons(protocol);
+                            memcpy(pkt->data, gse_get_vfrag_start(pdu_vfrag), pdu_size);
+                            pkt->size = pdu_size + 4;
+
+                            out_ip.written(1);
+                        }
+                        else
+                        {
+                            if(sch->debug2)
+                                fprintf(stderr, "GSE: No free space to write PDU!\n");
+                        }
+                    }
+                    else
+                    {
+                        if(sch->debug2)
+                            fprintf(stderr, "GSE: PDU too big!\n");
+                    }
+
+                    gse_free_vfrag(&pdu_vfrag);
+                }
+                else if(ret == GSE_STATUS_PADDING_DETECTED)
+                {
+                    if(sch->debug2)
+                        fprintf(stderr, "GSE: Padding detected\n");
+
+                    gse_pkt_size = dfl - done; // Assume rest of data is padding, since it is only present at the end
+                }
+                else if(ret == GSE_STATUS_TIMEOUT)
+                {
+                    if(sch->debug2)
+                        fprintf(stderr, "GSE: Current PDU timed out after 256 BBFRAMES\n");
+                }
+                else
+                {
+                    fprintf(stderr, "Error when feeding GSE packet to deencapsulator: %s\n", gse_get_status(ret));
+                    fail("Error when feeding GSE packet to deencapsulator");
+                }
+
+                done += gse_pkt_size;
+            }
+#else
+            if(sch->debug2)
+                fprintf(stderr, "GSE: Got GSE BBFRAME but GSE support is not available\n");
+#endif
+        }
 
         void info_unlocked()
         {
@@ -3389,11 +3633,14 @@ namespace leansdr
                         // 188     =  waiting for CRC
         uint8_t leftover[tspacket::SIZE];
         static const int MAX_TS_PER_BBFRAME = fec_info::KBCH_MAX / 8 / tspacket::SIZE + 1;
-        static const int MAX_GSE_PER_BBFRAME = fec_info::KBCH_MAX / 8 + 1;
+        static const int MAX_IP_PER_BBFRAME = fec_info::KBCH_MAX / 8 + 1; // Theoretically each GSE packet shuold be at least 4 bytes, but better be on the safe side...
         bool locked;
+#ifdef GSE
+        gse_deencap_t* deencap;
+#endif
         pipereader<bbframe> in;
         pipewriter<tspacket> out_ts;
-        pipewriter<u8> out_gse;
+        pipewriter<ippacket> out_ip;
         int current_state;
         pipewriter<int>* state_out;
         bool report_state;

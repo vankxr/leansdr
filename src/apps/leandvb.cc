@@ -20,8 +20,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <math.h>
+#ifdef GSE
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#endif
 #include <fcntl.h>
+#ifdef GSE
+#include <errno.h>
+#include <arpa/inet.h>
+#endif
+#include <math.h>
 
 #include "leansdr/framework.h"
 #include "leansdr/generic.h"
@@ -37,8 +46,35 @@
 
 using namespace leansdr;
 
-// Main loop
+#ifdef GSE
+int tun_alloc(char* dev, int flags)
+{
+    struct ifreq ifr;
+    int fd, err;
 
+    if((fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK)) < 0)
+        fail("Opening /dev/net/tun");
+
+    memset(&ifr, 0, sizeof(ifr));
+
+    ifr.ifr_flags = flags;
+
+    if(*dev)
+        strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
+
+    if((err = ioctl(fd, TUNSETIFF, (void*)&ifr)) < 0)
+    {
+        close(fd);
+        fail("ioctl(TUNSETIFF)");
+    }
+
+    strcpy(dev, ifr.ifr_name);
+
+    return fd;
+}
+#endif
+
+// Main loop
 struct config
 {
     bool verbose, debug, debug2;
@@ -62,7 +98,7 @@ struct config
     bool cnr;           // Measure CNR
     unsigned int decim; // Decimation, 0=auto
     int fd_pp;          // FD for preprocessed data, or -1
-    int fd_gse;         // FD for DVB-S2 Generic streams, or -1
+    int fd_tun;         // FD for DVB-S2 Generic streams, or -1
     int fd_iqsymbols;   // FD for sampled symbols, or -1
     float awgn;         // Standard deviation of noise
     float Fm;           // QPSK symbol rate (Hz)
@@ -126,7 +162,7 @@ struct config
         cnr(false),
         decim(0),
         fd_pp(-1),
-        fd_gse(-1),
+        fd_tun(-1),
         fd_iqsymbols(-1),
         awgn(0),
         Fm(2e6),
@@ -223,7 +259,7 @@ struct runtime_common
     pipebuf<int>* p_vbitcount;
     pipebuf<int>* p_verrcount;
     pipebuf<tspacket>* p_tspackets;
-    pipebuf<u8>* p_gsepackets;
+    pipebuf<ippacket>* p_ippackets;
 
     runtime_common(const config& cfg)
     {
@@ -271,8 +307,8 @@ struct runtime_common
         }
 
         // Min buffer size for TS packets: Up to 39 per BBFRAME
-        unsigned long BUF_S2PACKETS = (fec_info::KBCH_MAX / tspacket::SIZE / 8 + 1) * cfg.buf_factor;
-        unsigned long BUF_S2GSEPACKETS = (fec_info::KBCH_MAX / 8 + 1) * cfg.buf_factor;
+        unsigned long BUF_S2TSPACKETS = (fec_info::KBCH_MAX / 8 / tspacket::SIZE + 1) * cfg.buf_factor;
+        unsigned long BUF_S2IPPACKETS = (fec_info::KBCH_MAX / 8 + 1) * cfg.buf_factor;
         // Min buffer size for misc measurements: 1
         unsigned long BUF_SLOW = cfg.buf_factor;
 
@@ -539,7 +575,7 @@ struct runtime_common
         p_framelock = new pipebuf<int>(sch, "frame lock", BUF_SLOW);
         p_vber = new pipebuf<float>(sch, "VBER", BUF_SLOW);
         p_lock = new pipebuf<int>(sch, "lock", BUF_SLOW * 2);
-        p_locktime = new pipebuf<unsigned long>(sch, "locktime", BUF_S2PACKETS);
+        p_locktime = new pipebuf<unsigned long>(sch, "locktime", BUF_S2TSPACKETS);
 
         rrc_steps = cfg.rrc_steps;
 
@@ -620,25 +656,18 @@ struct runtime_common
         }
 #endif
 
-        p_tspackets = new pipebuf<tspacket>(sch, "TS packets", BUF_S2PACKETS);
-        p_gsepackets = new pipebuf<u8>(sch, "GSE packets", BUF_S2GSEPACKETS);
-        p_vbitcount = new pipebuf<int>(sch, "Bits processed", BUF_S2PACKETS);
-        p_verrcount = new pipebuf<int>(sch, "Bits corrected", BUF_S2PACKETS);
+        p_tspackets = new pipebuf<tspacket>(sch, "TS packets", BUF_S2TSPACKETS);
+        p_ippackets = new pipebuf<ippacket>(sch, "IP (GSE) packets", BUF_S2IPPACKETS);
+        p_vbitcount = new pipebuf<int>(sch, "Bits processed", BUF_S2TSPACKETS);
+        p_verrcount = new pipebuf<int>(sch, "Bits corrected", BUF_S2TSPACKETS);
 
         // Standard-specific code would go here,
         // outputting into p_tspackets and into the measurements channels.
 
-        new file_writer<tspacket>(sch, *p_tspackets, 1);
-        new file_writer<u8>(sch, *p_gsepackets, cfg.fd_gse);
+        file_writer<tspacket>* w_stdout = new file_writer<tspacket>(sch, *p_tspackets, 1);
+        file_writer<ippacket>* w_tunfd = new file_writer<ippacket>(sch, *p_ippackets, cfg.fd_tun);
 
-        if(cfg.fd_gse > -1 && lseek(cfg.fd_gse, 0, SEEK_CUR) < 0 && errno == ESPIPE && fcntl(cfg.fd_gse, F_SETPIPE_SZ, BUF_S2GSEPACKETS) < 0)
-        {
-            fprintf(stderr, "*** Failed to increase pipe size.\n"
-                "*** Try echo %lu > /proc/sys/fs/pipe-max-size\n",
-                BUF_S2GSEPACKETS);
-
-            fatal("F_SETPIPE_SZ");
-        }
+        w_tunfd->tunnel_mode = true;
 
         // BER ESTIMATION
 
@@ -676,7 +705,7 @@ struct runtime_common
         }
 
 #ifdef GUI
-        p_tscount = new pipebuf<float>(sch, "packet counter", BUF_S2PACKETS);
+        p_tscount = new pipebuf<float>(sch, "packet counter", BUF_S2TSPACKETS);
         new itemcounter<tspacket, float>(sch, *p_tspackets, *p_tscount);
 
         float max_packet_rate = cfg.Fm / 8 / 204;
@@ -833,7 +862,7 @@ int run_dvbs2(config& cfg)
     }
 
     // Deframe BB frames to TS packets
-    s2_deframer deframer(run.sch, p_bbframes, *run.p_tspackets, *run.p_gsepackets, run.p_lock, run.p_locktime);
+    s2_deframer deframer(run.sch, p_bbframes, *run.p_tspackets, *run.p_ippackets, run.p_lock, run.p_locktime);
 
     if(cfg.debug)
         fprintf(stderr,
@@ -1159,7 +1188,7 @@ int run_highspeed_s2(config& cfg)
     // Min buffer size for packets: 1
     unsigned long BUF_PACKETS = cfg.buf_factor;
     // Min buffer size for TS packets: Up to 39 per BBFRAME
-    unsigned long BUF_S2PACKETS = 39 * cfg.buf_factor;
+    unsigned long BUF_S2TSPACKETS = 39 * cfg.buf_factor;
     // Min buffer size for misc measurements: 1
     unsigned long BUF_SLOW = cfg.buf_factor;
 
@@ -1201,7 +1230,7 @@ int run_highspeed_s2(config& cfg)
     s2_deinterleaver deint(&sch, p_slots, p_fecframes);
     pipebuf<bbframe> p_bbframes(&sch, "BB frames", BUF_PACKETS);
     s2_fecdec fecdec(&sch, p_fecframes, p_bbframes);
-    pipebuf<tspacket> p_tspackets(&sch, "TS packets", BUF_S2PACKETS);
+    pipebuf<tspacket> p_tspackets(&sch, "TS packets", BUF_S2TSPACKETS);
     s2_deframer deframer(&sch, p_bbframes, p_tspackets);
     file_writer<tspacket> r_stdout(&sch, p_tspackets, 1);
     fprintf(stderr, "Running S2 --hs\n");
@@ -1488,8 +1517,7 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
 {
     fprintf(f, "Usage: %s [options]  < IQ  > TS\n", name);
     fprintf(f, "Demodulate DVB-S I/Q on stdin, output MPEG packets on stdout\n");
-    fprintf(
-        f,
+    fprintf(f,
         "\nInput options:\n"
         "  --u8           Input format is 8-bit unsigned (rtl_sdr, default)\n"
         "  --s12          Input format is 12/16-bit signed (PlutoSDR, LimeSDR)\n"
@@ -1499,8 +1527,7 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "  --loop         Repeat (stdin must be a file)\n"
         "  --inpipe INT   Resize stdin pipe (bytes)\n"
         "  --inbuf INT    Additional input buffering (samples)\n");
-    fprintf(
-        f,
+    fprintf(f,
         "\nPreprocessing options:\n"
         "  --anf INT             Number of birdies to remove (default: 0)\n"
         "  --derotate HZ         For use with --fd-pp, otherwise use --tune\n"
@@ -1525,8 +1552,7 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "  --cr NUM/DEN      Code rate: 1/2(default) .. 7/8\n"
         "  --viterbi         Use Viterbi (CPU-intensive)\n"
         "  --hard-metric     Use Hamming distances with Viterbi\n");
-    fprintf(
-        f,
+    fprintf(f,
         "\nDVB-S2 options:\n"
         "  --strongpls       Expect PLS symbols at max amplitude\n"
         "  --modcods INT     Bitmask of desired modcods\n"
@@ -1535,9 +1561,11 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "  --ldpc-bf INT     Max number of LDPC bitflips (default: 0)\n"
         "  --ldpc-helper CMD Spawn external LDPC decoder:\n"
         "                    'CMD --standard DVB-S2 --modcod N [--shortframes]'\n"
-        "  --nhelpers INT    Number of decoders per modcod/framesize\n");
-    fprintf(
-        f,
+        "  --nhelpers INT    Number of decoders per modcod/framesize\n"
+#ifdef GSE
+        "  --ip-tun NAME     Dump IP packets received via DVB-S2 generic stream (GSE) to this interface, create it if does not exist\n");
+#endif
+    fprintf(f,
         "\nCompatibility options:\n"
         "  --hdlc         Expect HDLC frames instead of MPEG packets\n"
         "  --packetized   Output 16-bit length prefix (default: as stream)\n");
@@ -1548,8 +1576,7 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "                    (Enables all CPU-intensive features)\n"
         "  --hs              Maximize throughput (QPSK CR1/2 only)\n"
         "                    (Disables all preprocessing)\n");
-    fprintf(
-        f,
+    fprintf(f,
         "\nUI options:\n"
         "  -h                   Display this help message and exit\n"
         "  -v                   Output debugging info at startup and exit\n"
@@ -1565,13 +1592,10 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "  --duration FLOAT  Width of timeline plot (s, default 60)\n"
         "  --linger          Keep GUI running after EOF\n");
 #endif
-    fprintf(
-        f,
+    fprintf(f,
         "\nTesting options:\n"
         "  --fd-pp FDNUM         Dump preprocessed IQ data to file descriptor\n"
         "  --fd-iqsymbols FDNUM  Dump sampled IQ symbols to file descriptor\n"
-        "  --fd-gse FDNUM        Dump DVB-S2 generic streams to file descriptor\n"
-        "  --f-gse PATH          Dump DVB-S2 generic streams to file\n"
         "  --awgn FLOAT          Add white gaussian noise stddev (slow)\n");
 
     if(info)
@@ -1763,17 +1787,23 @@ int main(int argc, const char* argv[])
             cfg.Fderot = atof(argv[++i]);
         else if(!strcmp(argv[i], "--fd-pp") && i + 1 < argc)
             cfg.fd_pp = atoi(argv[++i]);
-        else if(!strcmp(argv[i], "--f-gse") && i + 1 < argc)
+#ifdef GSE
+        else if(!strcmp(argv[i], "--ip-tun") && i + 1 < argc)
         {
-            int fd = open(argv[++i], O_WRONLY | O_CREAT, 0644);
+            char tunname[IFNAMSIZ];
+
+            strncpy(tunname, argv[++i], IFNAMSIZ - 1);
+
+            int fd = tun_alloc(tunname, IFF_TUN | IFF_MULTI_QUEUE);
 
             if(fd < 0)
-                fail("open gse file");
+                fail("open/create tunnel interface");
 
-            cfg.fd_gse = fd;
+            fprintf(stderr, "Created tunnel interface %s\n", tunname);
+
+            cfg.fd_tun = fd;
         }
-        else if(!strcmp(argv[i], "--fd-gse") && i + 1 < argc)
-            cfg.fd_gse = atoi(argv[++i]);
+#endif
         else if(!strcmp(argv[i], "--awgn") && i + 1 < argc)
             cfg.awgn = atof(argv[++i]);
         else if(!strcmp(argv[i], "--fd-info") && i + 1 < argc)
