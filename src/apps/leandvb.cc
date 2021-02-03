@@ -1563,8 +1563,9 @@ void usage(const char* name, FILE* f, int c, const char* info = NULL)
         "                    'CMD --standard DVB-S2 --modcod N [--shortframes]'\n"
         "  --nhelpers INT    Number of decoders per modcod/framesize\n"
 #ifdef GSE
-        "  --ip-tun NAME     Dump IP packets received via DVB-S2 generic stream (GSE) to this interface, create it if does not exist\n");
+        "  --ip-tun NAME     Dump IP packets received via DVB-S2 generic stream (GSE) to this interface, create it if does not exist\n"
 #endif
+    );
     fprintf(f,
         "\nCompatibility options:\n"
         "  --hdlc         Expect HDLC frames instead of MPEG packets\n"
